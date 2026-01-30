@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <time.h>
+#include <sys/time.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -24,6 +26,8 @@
 #define APP_VERSION     1
 #define WIFI_CONNECTED_BIT BIT0
 #define BUTTON_PIN      4
+TaskHandle_t blink_task_handle = NULL;
+#define BLINK_GPIO      2
 #define LONG_PRESS_TICKS 100  // 10 seconds (100 * 100ms)
 
 static const char *TAG = "CLEAN_START";
@@ -35,11 +39,6 @@ typedef struct {
 } struct_message;
 
 static struct_message myData;
-static bool lastButtonState = false;
-
-//static bool is_connected = false;
-
-//void start_websever();
 
 // --- 1. WIFI EVENT HANDLER ---
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
@@ -52,22 +51,10 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Successfully Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        //is_connected = true;
-        //start_webserver();
+        
 
     }
 }
-/*
-void start_webserver(void) {
-    httpd_handle_t server = NULL;
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-
-    ESO_LOGI(TAG, "STARTING WEB SERVER ON PORT : '%d", config.server_port);
-    if(httpd_start(&server, &config) == ESP_OK) {
-        httpd_register_uri_handler(server, &uri_get);
-    }
-}
-*/
 
 // --- 2. OTA LOGIC (Only runs after 10s trigger) ---
 
@@ -83,6 +70,12 @@ void start_ota_update(const char *url) {
     esp_task_wdt_delete(NULL); 
     
     esp_err_t ret = esp_https_ota(&ota_config);
+
+    if (blink_task_handle != NULL) {
+        vTaskDelete(blink_task_handle);
+        blink_task_handle = NULL;
+        gpio_set_level(BLINK_GPIO, 0); // Ensure LED is off
+    }
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Flash successful! Rebooting...");
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -147,11 +140,24 @@ void wifi_init_stable(void) {
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+
+void blink_task(void *pvParameter) {
+    
+    while(1) {
+        gpio_set_level(BLINK_GPIO, 1); // LED ON
+        vTaskDelay(pdMS_TO_TICKS(500));
+        gpio_set_level(BLINK_GPIO, 0); // LED OFF
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
 // --- 4. MAIN APP ---
 
 void app_main() 
 {
     // Global Initializations (Called ONCE)
+    gpio_reset_pin(BLINK_GPIO);
+    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
     ESP_LOGI(TAG, "Step 1: NVS Init...");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -213,13 +219,18 @@ void app_main()
     while (1) {
         bool currentButtonState = !gpio_get_level(BUTTON_PIN);
         esp_task_wdt_reset();
-
+        
         if (currentButtonState) {
             press_ticks++;
-            
-            // If 15 seconds reached
+            if (press_ticks < LONG_PRESS_TICKS) {
+            gpio_set_level(BLINK_GPIO, 1); // Solid ON during count
+        }
+            // If 10 seconds reached
             if (press_ticks == LONG_PRESS_TICKS) {
                 ESP_LOGW(TAG, "10s reached! Checking for updates...");
+                if (blink_task_handle == NULL) {
+                xTaskCreate(blink_task, "ota_blink", 2048, NULL, 5, &blink_task_handle);
+                }
                 wifi_init_stable();
                 
                 // Wait for Wi-Fi connection
@@ -232,10 +243,21 @@ void app_main()
                 esp_wifi_stop();
                 esp_wifi_deinit();
                 vEventGroupDelete(s_wifi_event_group);
+                if (blink_task_handle != NULL) {
+                vTaskDelete(blink_task_handle);
+                blink_task_handle = NULL;
+            }
+            gpio_set_level(BLINK_GPIO, 0);
+
                 press_ticks = 0; // Reset
             }
         } else {
             // Button was released - was it a normal LoRa press?
+            if (blink_task_handle != NULL) {
+            vTaskDelete(blink_task_handle);
+            blink_task_handle = NULL;
+        }
+        gpio_set_level(BLINK_GPIO, 0);
             if (press_ticks > 0 && press_ticks < 5) {
                 // YOUR ORIGINAL LORA SEND LOGIC
                 myData.buttonPressed = true;
@@ -243,6 +265,7 @@ void app_main()
                 lora_send_packet((uint8_t *)&myData, sizeof(myData));
                 ESP_LOGI(TAG, "Button Pressed - LoRa Data Sent");
             }
+        
             press_ticks = 0;
         }
 
